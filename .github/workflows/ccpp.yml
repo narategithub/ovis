@@ -12,7 +12,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: dependencies
-      run: apt-get install -y gettext libssl-dev bison flex swig python-dev
+      run: sudo apt-get install -y gettext libssl-dev bison flex swig python-dev
     - name: autogen
       run: ./autogen.sh
     - name: configure
