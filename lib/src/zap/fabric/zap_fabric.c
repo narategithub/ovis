@@ -83,8 +83,7 @@
 static struct {
 	struct z_fi_fabdom	dom[ZAP_FI_MAX_DOM];
 	int			dom_count;
-	int			cq_fd;
-	int			cm_fd;
+	int			efd; /* epoll fd */
 	uint64_t		mr_key;
 	zap_log_fn_t		log_fn;
 	pthread_mutex_t		lock;
@@ -149,11 +148,6 @@ static void dlog_(const char *func, int line, char *fmt, ...)
 #endif
 
 #ifdef CTXT_DEBUG
-#define __flush_io_q( _REP ) do { \
-	(_REP)->ep.z->log_fn("TMP_DEBUG: %s() flush_io_q %p, state %s\n", \
-			__func__, _REP, __zap_ep_state_str(_REP->ep.state)); \
-	flush_io_q(_REP); \
-} while (0)
 #define __context_alloc( _REP, _CTXT, _OP ) ({ \
 	(_REP)->ep.z->log_fn("TMP_DEBUG: %s(), context_alloc\n", __func__); \
 	_context_alloc(_REP, _CTXT, _OP); \
@@ -163,7 +157,6 @@ static void dlog_(const char *func, int line, char *fmt, ...)
 	_context_free(_CTXT); \
 })
 #else
-#define __flush_io_q(_REP) flush_io_q(_REP)
 #define __context_alloc( _REP, _CTXT, _OP ) _context_alloc(_REP, _CTXT, _OP)
 #define __context_free( _CTXT ) _context_free(_CTXT)
 #endif
@@ -203,8 +196,7 @@ static char *op_str[] = {
 static int		init_once();
 static int		z_fi_fill_rq(struct z_fi_ep *ep);
 static zap_err_t	z_fi_unmap(zap_ep_t ep, zap_map_t map);
-static void		*cm_thread_proc(void *arg);
-static void		*cq_thread_proc(void *arg);
+static void		*io_thread_proc(void *arg);
 static void		_context_free(struct z_fi_context *ctxt);
 static int		_buffer_init_pool(struct z_fi_ep *ep);
 static void		__buffer_free(struct z_fi_buffer *rbuf);
@@ -295,11 +287,11 @@ static int __enable_cq_events(struct z_fi_ep *rep)
 	/* handle CQ events */
 	struct epoll_event cq_event = {
 		.events = EPOLLIN,
-		.data.ptr = rep,
+		.data.ptr = &rep->cq,
 	};
 
 	__zap_get_ep(&rep->ep, "CQFD");
-	if (epoll_ctl(g.cq_fd, EPOLL_CTL_ADD, rep->cq_fd, &cq_event)) {
+	if (epoll_ctl(g.efd, EPOLL_CTL_ADD, rep->cq_fd, &cq_event)) {
 		LOG_(rep, "error %d adding CQ to epoll wait set\n", errno);
 		__zap_put_ep(&rep->ep, "CQFD");
 		return errno;
@@ -312,16 +304,10 @@ static void __teardown_conn(struct z_fi_ep *ep)
 {
 	int ret;
 	struct z_fi_ep *rep = (struct z_fi_ep *)ep;
-	struct epoll_event ignore;
 
 	DLOG("rep %p\n", rep);
 
 	assert (!rep->cm_fd || (rep->ep.state != ZAP_EP_CONNECTED));
-
-	if (rep->cm_fd) {
-		if (epoll_ctl(g.cm_fd, EPOLL_CTL_DEL, rep->cm_fd, &ignore))
-			LOG_(rep, "error %d removing EQ from epoll wait set\n", errno);
-	}
 
 	if (ep->fi_ep) {
 		ret = fi_close(&rep->fi_ep->fid);
@@ -687,17 +673,16 @@ static void _context_free(struct z_fi_context *ctxt)
 	free(ctxt);
 }
 
-/* Must be called with the credit lock held */
-static void flush_io_q(struct z_fi_ep *rep)
+/* must be called with rep->ep.lock held */
+static void __flush_ctxt(struct z_fi_ep *rep)
 {
 	struct z_fi_context *ctxt;
 	struct zap_event ev = {
 		.status = ZAP_ERR_FLUSH,
 	};
 
-	while (!TAILQ_EMPTY(&rep->io_q)) {
-		ctxt = TAILQ_FIRST(&rep->io_q);
-		TAILQ_REMOVE(&rep->io_q, ctxt, pending_link);
+	while ((ctxt = LIST_FIRST(&rep->active_ctxt_list))) {
+		LIST_REMOVE(ctxt, active_ctxt_link);
 		switch (ctxt->op) {
 		    case ZAP_WC_SEND:
 			/*
@@ -705,22 +690,24 @@ static void flush_io_q(struct z_fi_ep *rep)
 			 */
 			if (ctxt->u.send.rb)
 				__buffer_free(ctxt->u.send.rb);
-			__context_free(ctxt);
-			return;
+			break;
 		    case ZAP_WC_RDMA_WRITE:
 			ev.type = ZAP_EVENT_WRITE_COMPLETE;
 			ev.context = ctxt->usr_context;
+			rep->ep.cb(&rep->ep, &ev);
 			break;
 		    case ZAP_WC_RDMA_READ:
 			ev.type = ZAP_EVENT_READ_COMPLETE;
 			ev.context = ctxt->usr_context;
+			rep->ep.cb(&rep->ep, &ev);
 			break;
 		    case ZAP_WC_RECV:
+			/* no-op */
+			break;
 		    default:
 			LOG_(rep, "invalid op type %d in queued i/o\n", ctxt->op);
 			break;
 		}
-		rep->ep.cb(&rep->ep, &ev);
 		__context_free(ctxt);
 	}
 }
@@ -936,10 +923,9 @@ static zap_err_t z_fi_connect(zap_ep_t ep,
 	int rc;
 	zap_err_t zerr;
 	struct z_fi_ep *rep = (struct z_fi_ep *)ep;
-	struct zap_event zev;
 	struct epoll_event cm_event = {
 		.events = EPOLLIN,
-		.data.ptr = rep,
+		.data.ptr = &rep->eq,
 	};
 
 	memset(&rep->conn_data, 0, sizeof(rep->conn_data));
@@ -968,7 +954,7 @@ static zap_err_t z_fi_connect(zap_ep_t ep,
 		goto err_1;
 
 	__zap_get_ep(&rep->ep, "CONNECT");
-	rc = epoll_ctl(g.cm_fd, EPOLL_CTL_ADD, rep->cm_fd, &cm_event);
+	rc = epoll_ctl(g.efd, EPOLL_CTL_ADD, rep->cm_fd, &cm_event);
 	if (rc) {
 		zerr = ZAP_ERR_RESOURCE;
 		goto err_2;
@@ -978,12 +964,12 @@ static zap_err_t z_fi_connect(zap_ep_t ep,
 			&rep->conn_data,
 			rep->conn_data.data_len + sizeof(rep->conn_data));
 	if (rc) {
-		(void)epoll_ctl(g.cm_fd, EPOLL_CTL_DEL, rep->cm_fd, NULL);
-		zev.type = ZAP_EVENT_CONNECT_ERROR;
-		zev.status = ZAP_ERR_ROUTE;
-		rep->ep.state = ZAP_EP_ERROR;
-		rep->ep.cb(&rep->ep, &zev);
-		__zap_put_ep(&rep->ep, "CONNECT");
+		zerr = zap_errno2zerr(-rc);
+		(void)epoll_ctl(g.efd, EPOLL_CTL_DEL, rep->cm_fd, NULL);
+		pthread_mutex_lock(&rep->ep.lock);
+		__flush_ctxt(rep);
+		pthread_mutex_unlock(&rep->ep.lock);
+		goto err_2;
 	}
 
 	return ZAP_ERR_OK;
@@ -1156,6 +1142,7 @@ static void handle_rendezvous(struct z_fi_ep *rep,
 	zev.data_len = len - sizeof(*sh);
 	if (zev.data_len)
 		zev.data = (void*)sh->msg;
+	__zap_get_ep(&rep->ep, "RENDEZVOUS_MAP"); /* put by zap.c:zap_unmap() */
 	rep->ep.cb(&rep->ep, &zev);
 }
 
@@ -1293,7 +1280,7 @@ static zap_err_t z_fi_accept(zap_ep_t ep, zap_cb_fn_t cb,
 	struct z_fi_accept_msg *msg;
 	struct epoll_event cm_event = {
 		.events = EPOLLIN,
-		.data.ptr = rep,
+		.data.ptr = &rep->eq,
 	};
 
 	if (data_len > ZAP_ACCEPT_DATA_MAX - sizeof(*msg)) {
@@ -1314,7 +1301,7 @@ static zap_err_t z_fi_accept(zap_ep_t ep, zap_cb_fn_t cb,
 
 	__zap_get_ep(&rep->ep, "ACCEPT");
 	ret = __setup_conn(rep, NULL, 0);
-	ret = ret || epoll_ctl(g.cm_fd, EPOLL_CTL_ADD, rep->cm_fd, &cm_event);
+	ret = ret || epoll_ctl(g.efd, EPOLL_CTL_ADD, rep->cm_fd, &cm_event);
 	if (ret)
 		goto err_0;
 
@@ -1339,6 +1326,7 @@ static void scrub_cq(struct z_fi_ep *rep)
 	struct z_fi_context	*ctxt;
 	struct fi_cq_err_entry	entry;
 
+	__zap_get_ep(&rep->ep, "CQE");
 	DLOG("rep %p\n", rep);
 	while (1) {
 		memset(&entry, 0, sizeof(entry));
@@ -1400,62 +1388,11 @@ static void scrub_cq(struct z_fi_ep *rep)
 		__context_free(ctxt);
 		pthread_mutex_unlock(&rep->ep.lock);
 	}
-	DLOG("done with rep %p\n", rep);
-}
-
-static void *cq_thread_proc(void *arg)
-{
-	int ret, i, n;
-	struct z_fi_ep *rep;
-	struct epoll_event cq_events[16], ignore;
-	sigset_t sigset;
-
-	sigfillset(&sigset);
-	ret = pthread_sigmask(SIG_BLOCK, &sigset, NULL);
-	assert(ret == 0);
-
-	while (1) {
-		n = epoll_wait(g.cq_fd, cq_events, 16, -1);
-		DLOG("got %d events\n", n);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		for (i = 0; i < n; i++) {
-			rep = cq_events[i].data.ptr;
-			__zap_get_ep(&rep->ep, "CQE");
-			scrub_cq(rep);
-			pthread_mutex_lock(&rep->ep.lock);
-			/*
-			 * We know an endpoint is shut down when the
-			 * active ctxt list becomes empty. This is the
-			 * only condition under which *all* posted
-			 * wr's are completed (flushed), given how
-			 * SQ and RQ credits are exchanged.
-			 */
-			if (LIST_EMPTY(&rep->active_ctxt_list)) {
-				DLOG("rep %p ctxts drained\n", rep);
-				if (epoll_ctl(g.cq_fd, EPOLL_CTL_DEL, rep->cq_fd, &ignore)) {
-					LOG_(rep, "error %d removing CQ from epoll wait set\n", errno);
-				} else {
-					__zap_put_ep(&rep->ep, "CQFD");
-				}
-				if (rep->deferred_disconnected == 1) {
-					pthread_mutex_unlock(&rep->ep.lock);
-					__deliver_disconnected(rep);
-					rep->deferred_disconnected = -1;
-				} else {
-					pthread_mutex_unlock(&rep->ep.lock);
-				}
-			} else {
-				pthread_mutex_unlock(&rep->ep.lock);
-				submit_pending(rep);
-			}
-			__zap_put_ep(&rep->ep, "CQE");
-		}
+	if (rep->deferred_disconnected == 0) {
+		submit_pending(rep);
 	}
-	return NULL;
+	DLOG("done with rep %p\n", rep);
+	__zap_put_ep(&rep->ep, "CQE");
 }
 
 static zap_ep_t z_fi_new(zap_t z, zap_cb_fn_t cb)
@@ -1695,21 +1632,10 @@ static void handle_disconnected(struct z_fi_ep *rep, struct fi_eq_cm_entry *entr
 		LOG_(rep, "unexpected disconnect in state %d\n", rep->ep.state);
 		break;
 	}
+	rep->deferred_disconnected = 1;
+	/* disconnected event will be delivered in io_thread_proc() after
+	 * outstanding CQEs have been processed */
 	pthread_mutex_unlock(&rep->ep.lock);
-
-	pthread_mutex_lock(&rep->credit_lock);
-	__flush_io_q(rep);
-	pthread_mutex_unlock(&rep->credit_lock);
-
-	pthread_mutex_lock(&rep->ep.lock);
-
-	if (!LIST_EMPTY(&rep->active_ctxt_list)) {
-		rep->deferred_disconnected = 1;
-		pthread_mutex_unlock(&rep->ep.lock);
-	} else {
-		pthread_mutex_unlock(&rep->ep.lock);
-		__deliver_disconnected(rep);
-	}
 }
 
 static void cm_event_handler(struct z_fi_ep *rep,
@@ -1774,26 +1700,63 @@ static void scrub_eq(struct z_fi_ep *rep)
 	DLOG("done with rep %p\n", rep);
 }
 
-static void *cm_thread_proc(void *arg)
+static void *io_thread_proc(void *arg)
 {
 	int ret, i, n;
 	struct epoll_event cm_events[16];
 	sigset_t sigset;
+	struct fid **_ptr;
+	struct z_fi_ep *rep;
+	LIST_HEAD(, z_fi_ep) disconnected_eps;
 
 	sigfillset(&sigset);
 	ret = pthread_sigmask(SIG_BLOCK, &sigset, NULL);
 	assert(ret == 0);
 
 	while (1) {
-		n = epoll_wait(g.cm_fd, cm_events, 16, -1);
+		n = epoll_wait(g.efd, cm_events, 16, -1);
 		DLOG("got %d events\n", n);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
-		for (i = 0; i < n; ++i)
-			scrub_eq(cm_events[i].data.ptr);
+		for (i = 0; i < n; ++i) {
+			_ptr = cm_events[i].data.ptr;
+			switch ((*_ptr)->fclass) {
+			case FI_CLASS_CQ:
+				rep = container_of(_ptr, struct z_fi_ep, cq);
+				scrub_cq(rep);
+				break;
+			case FI_CLASS_EQ:
+				rep = container_of(_ptr, struct z_fi_ep, eq);
+				scrub_eq(rep);
+				if (rep->deferred_disconnected)
+					LIST_INSERT_HEAD(&disconnected_eps, rep, ep_link);
+				break;
+			default:
+				g.log_fn("zap_fabric error: Unexpected "
+					 "FI_CLASS: %lu\n", (*_ptr)->fclass);
+				assert(0 == "Unexpected FI_CLASS");
+			}
+		}
+		while ((rep = LIST_FIRST(&disconnected_eps))) {
+			LIST_REMOVE(rep, ep_link);
+			/* TODO remove cq & eq from epoll & cleanup context */
+			pthread_mutex_lock(&rep->ep.lock);
+			struct epoll_event ignore;
+			if (epoll_ctl(g.efd, EPOLL_CTL_DEL, rep->cq_fd, &ignore)) {
+				LOG_(rep, "error %d removing CQ from epoll wait set\n", errno);
+			} else {
+				__zap_put_ep(&rep->ep, "CQFD");
+			}
+			if (epoll_ctl(g.efd, EPOLL_CTL_DEL, rep->cm_fd, &ignore)) {
+				LOG_(rep, "error %d removing EQ from epoll wait set\n", errno);
+			}
+			__flush_ctxt(rep);
+			pthread_mutex_unlock(&rep->ep.lock);
+			__deliver_disconnected(rep);
+		}
 	}
 	return NULL;
 }
@@ -1979,8 +1942,8 @@ static zap_err_t z_fi_listen(zap_ep_t ep, struct sockaddr *saddr, socklen_t sa_l
 			   rep->fi->domain_attr->name);
 
 	cm_event.events = EPOLLIN;
-	cm_event.data.ptr = rep;
-	rc = epoll_ctl(g.cm_fd, EPOLL_CTL_ADD, rep->cm_fd, &cm_event);
+	cm_event.data.ptr = &rep->eq;
+	rc = epoll_ctl(g.efd, EPOLL_CTL_ADD, rep->cm_fd, &cm_event);
 	if (rc)
 		goto err_1;
 
@@ -1991,7 +1954,7 @@ static zap_err_t z_fi_listen(zap_ep_t ep, struct sockaddr *saddr, socklen_t sa_l
 	return ZAP_ERR_OK;
 
  err_1:
-	rc = epoll_ctl(g.cm_fd, EPOLL_CTL_DEL, rep->cm_fd, NULL);
+	rc = epoll_ctl(g.efd, EPOLL_CTL_DEL, rep->cm_fd, NULL);
 	fi_close(&rep->cq->fid);
 	fi_close(&rep->eq->fid);
 	fi_close(&rep->fi_pep->fid);
@@ -2273,19 +2236,15 @@ out:
 	return rc;
 }
 
-static pthread_t cm_thread, cq_thread;
+static pthread_t io_thread;
 
 static void z_fi_cleanup(void)
 {
 	void *dontcare;
 
-	if (cm_thread) {
-		pthread_cancel(cm_thread);
-		pthread_join(cm_thread, &dontcare);
-	}
-	if (cq_thread) {
-		pthread_cancel(cq_thread);
-		pthread_join(cq_thread, &dontcare);
+	if (io_thread) {
+		pthread_cancel(io_thread);
+		pthread_join(io_thread, &dontcare);
 	}
 }
 
@@ -2298,23 +2257,14 @@ static int init_once()
 	if (init_complete)
 		return 0;
 
-	g.cq_fd = epoll_create(512);
-	if (!g.cq_fd)
+	g.efd = epoll_create1(EPOLL_CLOEXEC);
+	if (g.efd < 0)
 		goto err_0;
 
-	g.cm_fd = epoll_create(512);
-	if (!g.cm_fd)
+	rc = pthread_create(&io_thread, NULL, io_thread_proc, NULL);
+	if (rc)
 		goto err_1;
-
-	rc = pthread_create(&cq_thread, NULL, cq_thread_proc, NULL);
-	if (rc)
-		goto err_2;
-	pthread_setname_np(cq_thread, "z_fi_cq");
-
-	rc = pthread_create(&cm_thread, NULL, cm_thread_proc, NULL);
-	if (rc)
-		goto err_3;
-	pthread_setname_np(cm_thread, "z_fi_cm");
+	pthread_setname_np(io_thread, "z_fi_io");
 
 	env = getenv(ZAP_FABRIC_INFO_LOG);
 	if (env)
@@ -2324,12 +2274,8 @@ static int init_once()
 	atexit(z_fi_cleanup);
 	return 0;
 
- err_3:
-	pthread_cancel(cq_thread);
- err_2:
-	close(g.cm_fd);
  err_1:
-	close(g.cq_fd);
+	close(g.efd);
  err_0:
 	return 1;
 }
