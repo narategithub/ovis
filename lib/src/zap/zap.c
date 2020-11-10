@@ -547,9 +547,11 @@ zap_err_t zap_get_name(zap_ep_t ep, struct sockaddr *local_sa,
 	return ep->z->get_name(ep, local_sa, remote_sa, sa_len);
 }
 
-void zap_get_ep(zap_ep_t ep)
+void ___zap_get_ep(zap_ep_t ep, const char *func, int line)
 {
 	assert(ep->ref_count);
+	DLOG(ep, "DEBUG %s:%d zap_get_ep(%p), ref_count: %d\n",
+		 func, line, ep, ep->ref_count);
 	(void)__sync_fetch_and_add(&ep->ref_count, 1);
 }
 
@@ -577,9 +579,11 @@ zap_ep_state_t zap_ep_state(zap_ep_t ep)
 	return ep->state;
 }
 
-void zap_put_ep(zap_ep_t ep)
+void ___zap_put_ep(zap_ep_t ep, const char *func, int line)
 {
 	assert(ep->ref_count);
+	DLOG(ep, "DEBUG %s:%d zap_put_ep(%p), ref_count: %d\n",
+		 func, line, ep, ep->ref_count);
 	if (0 == __sync_sub_and_fetch(&ep->ref_count, 1)) {
 		zap_event_queue_ep_put(ep->event_queue);
 		ep->z->destroy(ep);
