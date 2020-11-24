@@ -1,0 +1,21 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ master, CI ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-18.04
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: dependencies
+      run: sudo apt-get install -y gettext libssl-dev bison flex swig python-dev
+    - name: autogen
+      run: ./autogen.sh
+    - name: configure
+      run: ./configure CFLAGS='-Wall -Werror'
+    - name: make
+      run: make
