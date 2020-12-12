@@ -1054,6 +1054,16 @@ void __log_sep_msg(struct z_sock_ep *sep, int is_recv,
 			ntohs(msg->write_resp.status)
 		    );
 		break;
+	case SOCK_MSG_ACK_ACCEPTED:
+		LOG_(sep, "%s: %s, len: %u, xid: %#x, ctxt: %#lx, "
+			"\n",
+			lbl,
+			sock_msg_type_str(mtype),
+			ntohl(hdr->msg_len),
+			hdr->xid,
+			hdr->ctxt
+		    );
+		break;
 	default:
 		LOG_(sep, "%s: BAD TYPE %d\n", lbl, mtype);
 		break;
