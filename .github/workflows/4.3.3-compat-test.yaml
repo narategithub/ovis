@@ -40,7 +40,9 @@ jobs:
     - name: build and install
       run: |
         set -e
-        ./configure --prefix=/opt/ovis-4 --enable-etc
+        mkdir -p build
+        pushd build
+        ../configure --prefix=/opt/ovis-4 --enable-etc
         make
         make install
     - name: test preparation
@@ -191,6 +193,14 @@ jobs:
         D1=$(./ldms_ls.sh -x sock -p 10002)
         [[ -z "${D1}" ]] && echo "dir(agg-4) is empty (good)" || error "ERROR: dir(agg-4) is not empty"
         echo "DONE!"
+    - name: enum compatibility check
+      if: ${{ success() }} # all previous steps are good
+      run: |
+        set -e
+        pushd .github/enum-check
+        ./enumsym.py /root/ovis-4.3.3 -e ovis-4.3.3-enum.list > /test/4.3.3.out
+        ./enumsym.py ../../ -e ovis-4.3.3-enum.list > /test/HEAD.out
+        diff -u /test/4.3.3.out /test/HEAD.out > /test/enum.diff
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
