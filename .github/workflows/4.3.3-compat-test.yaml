@@ -21,9 +21,11 @@ name: Compatibility test with OVIS-4.3.3
 
 on:
   push:
-    branches: [ OVIS-4 ]
+    #branches: [ OVIS-4 ]
+    branches: [ TEST ]
   pull_request:
-    branches: [ OVIS-4 ]
+    #branches: [ OVIS-4 ]
+    branches: [ TEST ]
 
 defaults:
   run:
@@ -33,7 +35,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container:
-        image: ovishpc/ovis-4.3.3-centos7
+        image: ovishpc/ovis-compat-centos7
     steps:
     - uses: actions/checkout@v2
     - run: sh autogen.sh
@@ -198,9 +200,13 @@ jobs:
       run: |
         set -e
         pushd .github/enum-check
-        ./enumsym.py /root/ovis-4.3.3 -e ovis-4.3.3-enum.list > /test/4.3.3.out
-        ./enumsym.py ../../ -e ovis-4.3.3-enum.list > /test/HEAD.out
-        diff -u /test/4.3.3.out /test/HEAD.out > /test/enum.diff
+        for V in 4.3.{3,4,5,6}; do
+          ./enumsym.py /root/ovis-ldms-${V}/ -e ovis-${V}-enum.list > /test/${V}.enum
+          ./enumsym.py ../../ -e ovis-${V}-enum.list > /test/HEAD-${V}.enum
+        done
+        for V in 4.3.{3,4,5,6}; do
+          diff -u /test/${V}.enum /test/HEAD-${V}.enum > /test/enum-${V}.diff
+        done
     - uses: actions/upload-artifact@v2
       if: ${{ always() }}
       with:
